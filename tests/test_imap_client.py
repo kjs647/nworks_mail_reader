@@ -1,0 +1,152 @@
+import unittest
+
+from nworks_mail_mcp.config import ImapConfig
+from nworks_mail_mcp.imap_client import NworksImapClient
+
+
+class FakeImapConnection:
+    def __init__(
+        self,
+        search_result: bytes = b"",
+        failed_fetch_uids=None,
+        list_rows=None,
+        uidvalidity: bytes | None = b"777",
+    ):
+        self.search_result = search_result
+        self.failed_fetch_uids = set(failed_fetch_uids or [])
+        self.list_rows = list_rows or []
+        self.uidvalidity = uidvalidity
+        self.uid_calls = []
+        self.selected = []
+
+    def list(self):
+        return "OK", self.list_rows
+
+    def select(self, folder, readonly=True):
+        self.selected.append((folder, readonly))
+        return "OK", [b"3"]
+
+    def response(self, code):
+        if code == "UIDVALIDITY" and self.uidvalidity is not None:
+            return "OK", [self.uidvalidity]
+        return "OK", [None]
+
+    def uid(self, command, *args):
+        self.uid_calls.append((command, args))
+        if command == "search":
+            return "OK", [self.search_result]
+        if command == "fetch":
+            uid = args[0]
+            if uid in self.failed_fetch_uids:
+                return "NO", []
+            raw = (
+                b"Subject: Test " + uid.encode("ascii") + b"\r\n"
+                b"From: sender@example.com\r\n"
+                b"Date: Thu, 28 May 2026 10:00:00 +0900\r\n"
+                b"\r\n"
+            )
+            return "OK", [(b"HEADER", raw)]
+        raise AssertionError(f"unexpected uid command: {command}")
+
+
+class NworksImapClientTest(unittest.TestCase):
+    def make_client(self, conn):
+        config = ImapConfig(
+            host="imap.example.com",
+            port=993,
+            username="user@example.com",
+            password="secret",
+        )
+        client = NworksImapClient(config)
+        client.conn = conn
+        return client
+
+    def test_list_messages_since_uid_searches_newer_uid_range(self):
+        conn = FakeImapConnection(b"121 122 123")
+        client = self.make_client(conn)
+
+        result = client.list_messages_since_uid(
+            "INBOX",
+            last_uid=120,
+            limit=10,
+            expected_uidvalidity=777,
+        )
+
+        self.assertEqual([message.uid for message in result.messages], ["121", "122", "123"])
+        self.assertEqual(result.uidvalidity, 777)
+        self.assertEqual(conn.selected, [("INBOX", True)])
+        self.assertEqual(conn.uid_calls[0], ("search", (None, "UID", "121:*")))
+
+    def test_list_messages_since_uid_restarts_when_uidvalidity_is_unknown(self):
+        conn = FakeImapConnection(b"1 2 3")
+        client = self.make_client(conn)
+
+        result = client.list_messages_since_uid("INBOX", last_uid=120, limit=10)
+
+        self.assertEqual([message.uid for message in result.messages], ["1", "2", "3"])
+        self.assertEqual(conn.uid_calls[0], ("search", (None, "UID", "1:*")))
+
+    def test_list_messages_since_uid_restarts_when_uidvalidity_changes(self):
+        conn = FakeImapConnection(b"1 2 3", uidvalidity=b"888")
+        client = self.make_client(conn)
+
+        result = client.list_messages_since_uid(
+            "INBOX",
+            last_uid=120,
+            limit=10,
+            expected_uidvalidity=777,
+        )
+
+        self.assertEqual([message.uid for message in result.messages], ["1", "2", "3"])
+        self.assertEqual(result.uidvalidity, 888)
+        self.assertEqual(conn.uid_calls[0], ("search", (None, "UID", "1:*")))
+
+    def test_list_messages_since_uid_limits_oldest_first_to_avoid_skipping(self):
+        conn = FakeImapConnection(b"121 122 123 124")
+        client = self.make_client(conn)
+
+        result = client.list_messages_since_uid("INBOX", last_uid=120, limit=2)
+
+        self.assertEqual([message.uid for message in result.messages], ["121", "122"])
+
+    def test_list_messages_since_uid_stops_at_first_failed_fetch(self):
+        conn = FakeImapConnection(b"121 122 123", failed_fetch_uids={"122"})
+        client = self.make_client(conn)
+
+        result = client.list_messages_since_uid("INBOX", last_uid=120, limit=10)
+
+        self.assertEqual([message.uid for message in result.messages], ["121"])
+        self.assertNotIn(("fetch", ("123", "(BODY.PEEK[HEADER.FIELDS (SUBJECT FROM DATE)])")), conn.uid_calls)
+
+    def test_list_folders_preserves_quoted_names_with_spaces(self):
+        conn = FakeImapConnection(
+            list_rows=[b'(\\HasNoChildren) "/" "Project A"']
+        )
+        client = self.make_client(conn)
+
+        folders = client.list_folders()
+
+        self.assertEqual([folder.name for folder in folders], ["Project A"])
+
+    def test_list_folders_decodes_modified_utf7_names(self):
+        conn = FakeImapConnection(
+            list_rows=[b'(\\HasNoChildren) "/" "&0UzCpNK4-"']
+        )
+        client = self.make_client(conn)
+
+        folders = client.list_folders()
+
+        self.assertEqual([folder.name for folder in folders], ["테스트"])
+
+    def test_list_messages_since_uid_allows_missing_uidvalidity(self):
+        conn = FakeImapConnection(b"121", uidvalidity=None)
+        client = self.make_client(conn)
+
+        result = client.list_messages_since_uid("INBOX", last_uid=120, limit=10)
+
+        self.assertIsNone(result.uidvalidity)
+        self.assertEqual([message.uid for message in result.messages], ["121"])
+
+
+if __name__ == "__main__":
+    unittest.main()

@@ -1,0 +1,26 @@
+[project]
+name = "nmail-reader"
+version = "0.1.0"
+description = "MCP server for reading Naver WORKS mail via IMAP"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "mcp[cli]",
+]
+keywords = ["mcp", "imap", "naver-works", "mail"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Communications :: Email",
+]
+
+[project.scripts]
+nmail-reader = "nworks_mail_mcp.server:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/nworks_mail_mcp"]
