@@ -1,11 +1,13 @@
 import email
 import imaplib
 import base64
+import html
 import re
 from collections.abc import Sequence
 from dataclasses import dataclass
 from email.header import decode_header, make_header
 from email.message import Message
+from email import policy
 
 from .config import ImapConfig, load_imap_config
 
@@ -21,6 +23,17 @@ class MailSummary:
     subject: str
     sender: str
     date: str
+
+
+@dataclass(frozen=True)
+class MailBody:
+    uid: str
+    subject: str
+    sender: str
+    date: str
+    body: str
+    body_text_type: str
+    truncated: bool
 
 
 @dataclass(frozen=True)
@@ -115,6 +128,55 @@ class NworksImapClient:
         messages = self._fetch_message_summaries(uids[:limit], stop_on_failure=True)
         return MailReadResult(messages=messages, uidvalidity=uidvalidity)
 
+    def get_message_body(
+        self,
+        folder: str = "INBOX",
+        uid: str = "",
+        max_chars: int = 20000,
+    ) -> MailBody:
+        conn = self._require_conn()
+
+        status, _ = conn.select(folder, readonly=True)
+        if status != "OK":
+            raise RuntimeError(f"Failed to select folder: {folder}")
+
+        return self._fetch_message_body(uid, max_chars=max_chars)
+
+    def search_messages_by_body(
+        self,
+        folder: str = "INBOX",
+        query: str = "",
+        limit: int = 20,
+        max_scan: int = 200,
+        max_body_chars: int = 2000,
+    ) -> list[MailBody]:
+        conn = self._require_conn()
+
+        status, _ = conn.select(folder, readonly=True)
+        if status != "OK":
+            raise RuntimeError(f"Failed to select folder: {folder}")
+
+        status, data = conn.uid("search", None, "ALL")
+        if status != "OK" or not data or not data[0]:
+            return []
+
+        query_text = query.casefold()
+        uids = data[0].decode().split()
+        recent_uids = list(reversed(uids))[:max_scan]
+        matches: list[MailBody] = []
+
+        for uid in recent_uids:
+            try:
+                message = self._fetch_message_body(uid, max_chars=None)
+            except RuntimeError:
+                continue
+            if query_text in message.body.casefold():
+                matches.append(_limit_mail_body(message, max_body_chars))
+                if len(matches) >= limit:
+                    break
+
+        return matches
+
     def _fetch_message_summaries(
         self,
         uids: Sequence[str],
@@ -152,13 +214,35 @@ class NworksImapClient:
 
         return messages
 
-    def _parse_header(self, msg_data) -> Message | None:
-        raw_header = None
-        for item in msg_data:
-            if isinstance(item, tuple):
-                raw_header = item[1]
-                break
+    def _fetch_message_body(self, uid: str, max_chars: int | None) -> MailBody:
+        conn = self._require_conn()
+        status, msg_data = conn.uid("fetch", uid, "(BODY.PEEK[])")
+        if status != "OK" or not msg_data:
+            raise RuntimeError(f"Failed to fetch message body for UID: {uid}")
 
+        raw_message = _extract_first_tuple_payload(msg_data)
+        if raw_message is None:
+            raise RuntimeError(f"Failed to parse message body for UID: {uid}")
+
+        msg = email.message_from_bytes(raw_message, policy=policy.default)
+        body, body_text_type = _extract_body_text(msg)
+        body = _normalize_text(body)
+        truncated = max_chars is not None and len(body) > max_chars
+        if truncated:
+            body = body[:max_chars]
+
+        return MailBody(
+            uid=uid,
+            subject=_decode_header_value(msg.get("Subject", "")),
+            sender=_decode_header_value(msg.get("From", "")),
+            date=msg.get("Date", ""),
+            body=body,
+            body_text_type=body_text_type,
+            truncated=truncated,
+        )
+
+    def _parse_header(self, msg_data) -> Message | None:
+        raw_header = _extract_first_tuple_payload(msg_data)
         if raw_header is None:
             return None
 
@@ -187,6 +271,36 @@ def list_messages_since_uid(
             last_uid=last_uid,
             limit=limit,
             expected_uidvalidity=expected_uidvalidity,
+        )
+
+
+def get_message_body(
+    folder: str = "INBOX",
+    uid: str = "",
+    max_chars: int = 20000,
+) -> MailBody:
+    with NworksImapClient() as client:
+        return client.get_message_body(
+            folder=folder,
+            uid=uid,
+            max_chars=max_chars,
+        )
+
+
+def search_messages_by_body(
+    folder: str = "INBOX",
+    query: str = "",
+    limit: int = 20,
+    max_scan: int = 200,
+    max_body_chars: int = 2000,
+) -> list[MailBody]:
+    with NworksImapClient() as client:
+        return client.search_messages_by_body(
+            folder=folder,
+            query=query,
+            limit=limit,
+            max_scan=max_scan,
+            max_body_chars=max_body_chars,
         )
 
 
@@ -241,3 +355,81 @@ def _read_uidvalidity(conn: imaplib.IMAP4_SSL) -> int | None:
             return int(match.group(0))
 
     return None
+
+
+def _extract_first_tuple_payload(msg_data) -> bytes | None:
+    for item in msg_data:
+        if isinstance(item, tuple):
+            return item[1]
+    return None
+
+
+def _decode_header_value(value: str | None) -> str:
+    return str(make_header(decode_header(value or "")))
+
+
+def _extract_body_text(msg: Message) -> tuple[str, str]:
+    plain_parts: list[str] = []
+    html_parts: list[str] = []
+
+    parts = msg.walk() if msg.is_multipart() else [msg]
+    for part in parts:
+        if part.is_multipart():
+            continue
+        if _is_attachment(part):
+            continue
+
+        content_type = part.get_content_type()
+        if content_type == "text/plain":
+            plain_parts.append(_part_text(part))
+        elif content_type == "text/html":
+            html_parts.append(_html_to_text(_part_text(part)))
+
+    if plain_parts:
+        return "\n".join(plain_parts), "plain"
+    if html_parts:
+        return "\n".join(html_parts), "html"
+    return "", "none"
+
+
+def _is_attachment(part: Message) -> bool:
+    return part.get_content_disposition() == "attachment" or bool(part.get_filename())
+
+
+def _part_text(part: Message) -> str:
+    try:
+        content = part.get_content()
+    except (LookupError, UnicodeDecodeError):
+        payload = part.get_payload(decode=True)
+        if payload is None:
+            return ""
+        charset = part.get_content_charset() or "utf-8"
+        return payload.decode(charset, errors="replace")
+
+    return content if isinstance(content, str) else ""
+
+
+def _html_to_text(value: str) -> str:
+    text = re.sub(r"(?is)<(script|style).*?>.*?</\1>", " ", value)
+    text = re.sub(r"(?is)<br\s*/?>", "\n", text)
+    text = re.sub(r"(?is)</p\s*>", "\n", text)
+    text = re.sub(r"(?is)<[^>]+>", " ", text)
+    return html.unescape(text)
+
+
+def _normalize_text(value: str) -> str:
+    lines = [" ".join(line.split()) for line in value.splitlines()]
+    return "\n".join(line for line in lines if line).strip()
+
+
+def _limit_mail_body(message: MailBody, max_chars: int) -> MailBody:
+    truncated = len(message.body) > max_chars
+    return MailBody(
+        uid=message.uid,
+        subject=message.subject,
+        sender=message.sender,
+        date=message.date,
+        body=message.body[:max_chars] if truncated else message.body,
+        body_text_type=message.body_text_type,
+        truncated=message.truncated or truncated,
+    )

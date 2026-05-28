@@ -11,11 +11,13 @@ class FakeImapConnection:
         failed_fetch_uids=None,
         list_rows=None,
         uidvalidity: bytes | None = b"777",
+        messages=None,
     ):
         self.search_result = search_result
         self.failed_fetch_uids = set(failed_fetch_uids or [])
         self.list_rows = list_rows or []
         self.uidvalidity = uidvalidity
+        self.messages = messages or {}
         self.uid_calls = []
         self.selected = []
 
@@ -37,8 +39,11 @@ class FakeImapConnection:
             return "OK", [self.search_result]
         if command == "fetch":
             uid = args[0]
+            fetch_spec = args[1]
             if uid in self.failed_fetch_uids:
                 return "NO", []
+            if fetch_spec == "(BODY.PEEK[])":
+                return "OK", [(b"RFC822", self.messages[uid])]
             raw = (
                 b"Subject: Test " + uid.encode("ascii") + b"\r\n"
                 b"From: sender@example.com\r\n"
@@ -146,6 +151,109 @@ class NworksImapClientTest(unittest.TestCase):
 
         self.assertIsNone(result.uidvalidity)
         self.assertEqual([message.uid for message in result.messages], ["121"])
+
+    def test_get_message_body_reads_plain_text_without_marking_seen(self):
+        raw_message = (
+            b"Subject: Body mail\r\n"
+            b"From: sender@example.com\r\n"
+            b"Date: Thu, 28 May 2026 10:00:00 +0900\r\n"
+            b"Content-Type: text/plain; charset=utf-8\r\n"
+            b"\r\n" +
+            "본문 내용입니다.".encode("utf-8")
+        )
+        conn = FakeImapConnection(messages={"121": raw_message})
+        client = self.make_client(conn)
+
+        message = client.get_message_body("INBOX", "121", max_chars=100)
+
+        self.assertEqual(message.uid, "121")
+        self.assertEqual(message.subject, "Body mail")
+        self.assertEqual(message.sender, "sender@example.com")
+        self.assertEqual(message.body, "본문 내용입니다.")
+        self.assertEqual(message.body_text_type, "plain")
+        self.assertFalse(message.truncated)
+        self.assertEqual(conn.selected, [("INBOX", True)])
+        self.assertIn(("fetch", ("121", "(BODY.PEEK[])")), conn.uid_calls)
+
+    def test_get_message_body_prefers_plain_text_and_skips_attachments(self):
+        raw_message = (
+            b"Subject: Multipart\r\n"
+            b"From: sender@example.com\r\n"
+            b"Date: Thu, 28 May 2026 10:00:00 +0900\r\n"
+            b"Content-Type: multipart/mixed; boundary=abc\r\n"
+            b"\r\n"
+            b"--abc\r\n"
+            b"Content-Type: text/html; charset=utf-8\r\n"
+            b"\r\n"
+            b"<p>HTML body</p>\r\n"
+            b"--abc\r\n"
+            b"Content-Type: text/plain; charset=utf-8\r\n"
+            b"\r\n"
+            b"Plain body\r\n"
+            b"--abc\r\n"
+            b"Content-Type: text/plain; name=notes.txt\r\n"
+            b"Content-Disposition: attachment; filename=notes.txt\r\n"
+            b"\r\n"
+            b"Attachment text\r\n"
+            b"--abc--\r\n"
+        )
+        conn = FakeImapConnection(messages={"122": raw_message})
+        client = self.make_client(conn)
+
+        message = client.get_message_body("INBOX", "122", max_chars=100)
+
+        self.assertEqual(message.body, "Plain body")
+        self.assertEqual(message.body_text_type, "plain")
+
+    def test_get_message_body_falls_back_to_html_text_and_truncates(self):
+        raw_message = (
+            b"Subject: Html only\r\n"
+            b"From: sender@example.com\r\n"
+            b"Date: Thu, 28 May 2026 10:00:00 +0900\r\n"
+            b"Content-Type: text/html; charset=utf-8\r\n"
+            b"\r\n"
+            b"<html><body><h1>Hello</h1><p>World &amp; Team</p></body></html>"
+        )
+        conn = FakeImapConnection(messages={"123": raw_message})
+        client = self.make_client(conn)
+
+        message = client.get_message_body("INBOX", "123", max_chars=12)
+
+        self.assertEqual(message.body, "Hello World ")
+        self.assertEqual(message.body_text_type, "html")
+        self.assertTrue(message.truncated)
+
+    def test_search_messages_by_body_scans_recent_messages_and_returns_matches(self):
+        messages = {
+            "121": (
+                b"Subject: Old\r\nFrom: sender@example.com\r\nDate: Thu, 28 May 2026 09:00:00 +0900\r\n"
+                b"Content-Type: text/plain; charset=utf-8\r\n\r\nalpha"
+            ),
+            "122": (
+                b"Subject: Match\r\nFrom: sender@example.com\r\nDate: Thu, 28 May 2026 10:00:00 +0900\r\n"
+                b"Content-Type: text/plain; charset=utf-8\r\n\r\nProject KEYWORD update"
+            ),
+            "123": (
+                b"Subject: Recent\r\nFrom: sender@example.com\r\nDate: Thu, 28 May 2026 11:00:00 +0900\r\n"
+                b"Content-Type: text/plain; charset=utf-8\r\n\r\nnothing here"
+            ),
+        }
+        conn = FakeImapConnection(search_result=b"121 122 123", messages=messages)
+        client = self.make_client(conn)
+
+        results = client.search_messages_by_body(
+            "INBOX",
+            query="keyword",
+            limit=5,
+            max_scan=2,
+            max_body_chars=10,
+        )
+
+        self.assertEqual([message.uid for message in results], ["122"])
+        self.assertEqual(results[0].subject, "Match")
+        self.assertEqual(results[0].body, "Project KE")
+        self.assertTrue(results[0].truncated)
+        self.assertNotIn(("fetch", ("121", "(BODY.PEEK[])")), conn.uid_calls)
 
 
 if __name__ == "__main__":
