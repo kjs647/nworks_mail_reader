@@ -42,6 +42,25 @@ class MailReadResult:
     uidvalidity: int | None
 
 
+@dataclass(frozen=True)
+class MailUidList:
+    uids: list[str]
+    uidvalidity: int | None
+
+
+@dataclass(frozen=True)
+class MailIndexMessage:
+    uid: str
+    subject: str
+    sender: str
+    date: str
+    body: str
+    body_text_type: str
+    truncated: bool
+    body_index_blocked: bool
+    block_reason: str | None
+
+
 class NworksImapClient:
     def __init__(self, config: ImapConfig | None = None):
         self.config = config or load_imap_config()
@@ -127,6 +146,81 @@ class NworksImapClient:
         uids = data[0].decode().split()
         messages = self._fetch_message_summaries(uids[:limit], stop_on_failure=True)
         return MailReadResult(messages=messages, uidvalidity=uidvalidity)
+
+    def list_message_uids(
+        self,
+        folder: str = "INBOX",
+        uid_range: str = "ALL",
+    ) -> MailUidList:
+        conn = self._require_conn()
+
+        status, _ = conn.select(folder, readonly=True)
+        if status != "OK":
+            raise RuntimeError(f"Failed to select folder: {folder}")
+
+        uidvalidity = _read_uidvalidity(conn)
+        if uid_range == "ALL":
+            status, data = conn.uid("search", None, "ALL")
+        else:
+            status, data = conn.uid("search", None, "UID", uid_range)
+        if status != "OK" or not data or not data[0]:
+            return MailUidList(uids=[], uidvalidity=uidvalidity)
+
+        return MailUidList(uids=data[0].decode().split(), uidvalidity=uidvalidity)
+
+    def get_messages_for_index(
+        self,
+        folder: str,
+        uids: Sequence[str],
+        skip_subject_keywords: Sequence[str] | None = None,
+        block_reason: str | None = None,
+    ) -> list[MailIndexMessage]:
+        conn = self._require_conn()
+
+        status, _ = conn.select(folder, readonly=True)
+        if status != "OK":
+            raise RuntimeError(f"Failed to select folder: {folder}")
+
+        messages: list[MailIndexMessage] = []
+        for uid in uids:
+            if skip_subject_keywords:
+                summary = self._fetch_message_summary(uid)
+                if summary is None:
+                    continue
+                if _contains_keyword(summary.subject, skip_subject_keywords):
+                    messages.append(
+                        MailIndexMessage(
+                            uid=uid,
+                            subject=summary.subject,
+                            sender=summary.sender,
+                            date=summary.date,
+                            body="",
+                            body_text_type="blocked",
+                            truncated=False,
+                            body_index_blocked=True,
+                            block_reason=block_reason,
+                        )
+                    )
+                    continue
+
+            try:
+                body = self._fetch_message_body(uid, max_chars=None)
+            except RuntimeError:
+                continue
+            messages.append(
+                MailIndexMessage(
+                    uid=body.uid,
+                    subject=body.subject,
+                    sender=body.sender,
+                    date=body.date,
+                    body=body.body,
+                    body_text_type=body.body_text_type,
+                    truncated=body.truncated,
+                    body_index_blocked=False,
+                    block_reason=None,
+                )
+            )
+        return messages
 
     def get_message_body(
         self,
@@ -338,6 +432,26 @@ def search_messages_by_body(
             max_scan=max_scan,
             max_body_chars=max_body_chars,
             skip_subject_keywords=skip_subject_keywords,
+        )
+
+
+def list_message_uids(folder: str = "INBOX", uid_range: str = "ALL") -> MailUidList:
+    with NworksImapClient() as client:
+        return client.list_message_uids(folder=folder, uid_range=uid_range)
+
+
+def get_messages_for_index(
+    folder: str,
+    uids: Sequence[str],
+    skip_subject_keywords: Sequence[str] | None = None,
+    block_reason: str | None = None,
+) -> list[MailIndexMessage]:
+    with NworksImapClient() as client:
+        return client.get_messages_for_index(
+            folder=folder,
+            uids=uids,
+            skip_subject_keywords=skip_subject_keywords,
+            block_reason=block_reason,
         )
 
 

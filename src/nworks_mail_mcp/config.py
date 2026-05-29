@@ -30,3 +30,6 @@ def load_imap_config() -> ImapConfig:
 def load_state_path() -> Path:
     return Path(os.getenv("NWORKS_STATE_PATH", ".nworks_mail_state.json"))
 
+
+def load_index_path() -> Path:
+    return Path(os.getenv("NWORKS_INDEX_PATH", ".nworks_mail_index.sqlite"))

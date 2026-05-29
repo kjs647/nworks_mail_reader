@@ -15,3 +15,5 @@ wheels/
 
 # Local mail reader state
 .nworks_mail_state.json
+.nworks_mail_index.sqlite
+.nworks_mail_index.sqlite-*

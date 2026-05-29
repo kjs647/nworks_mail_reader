@@ -10,8 +10,12 @@ from nworks_mail_mcp.server import (
     read_message_body,
     read_messages,
     read_new_messages,
+    search_messages_context,
     search_messages_by_body,
+    sync_mail_index,
 )
+from nworks_mail_mcp.index_sync import MailIndexSyncResult
+from nworks_mail_mcp.mail_index import MailSearchResult
 
 
 class ServerToolTest(unittest.TestCase):
@@ -383,6 +387,72 @@ class ServerToolTest(unittest.TestCase):
 
         self.assertEqual(result[0]["body"], "keyword password=[REDACTED:SECRET]")
         search.assert_called_once_with("INBOX", "keyword", 3, 20, None, None)
+
+    def test_sync_mail_index_uses_compensation_block_policy(self):
+        with patch("nworks_mail_mcp.server.sync_mail_index_impl") as sync:
+            sync.return_value = MailIndexSyncResult(
+                folder="INBOX",
+                uidvalidity=777,
+                indexed_count=1,
+                deleted_count=0,
+                last_uid=121,
+                reset=False,
+                full_check=False,
+            )
+
+            result = sync_mail_index(folder="INBOX")
+
+        self.assertTrue(result["ok"])
+        self.assertIn("연봉", sync.call_args.kwargs["skip_subject_keywords"])
+        self.assertFalse(sync.call_args.kwargs["allow_blocked_body"])
+
+    def test_search_messages_context_redacts_results_and_reports_sync_failure(self):
+        with patch("nworks_mail_mcp.server.sync_mail_index_impl") as sync:
+            with patch("nworks_mail_mcp.server.search_mail_index") as search:
+                sync.side_effect = RuntimeError("imap unavailable")
+                search.return_value = [
+                    MailSearchResult(
+                        uid="121",
+                        folder="INBOX",
+                        subject="Token mail",
+                        sender="sender@example.com",
+                        date="Thu, 28 May 2026 10:00:00 +0900",
+                        excerpt="password=secret-value",
+                        score=-1.0,
+                        is_deleted=False,
+                        body_index_blocked=False,
+                        block_reason=None,
+                    )
+                ]
+
+                result = search_messages_context(
+                    folder="INBOX",
+                    query="password",
+                    limit=20,
+                )
+
+        self.assertFalse(result["sync"]["ok"])
+        self.assertEqual(result["results"][0]["excerpt"], "password=[REDACTED:SECRET]")
+        search.assert_called_once_with(folder="INBOX", query="password", limit=20)
+
+    def test_search_messages_context_limits_initial_sync_work(self):
+        with patch("nworks_mail_mcp.server.sync_mail_index_impl") as sync:
+            with patch("nworks_mail_mcp.server.search_mail_index") as search:
+                sync.return_value = MailIndexSyncResult(
+                    folder="INBOX",
+                    uidvalidity=777,
+                    indexed_count=0,
+                    deleted_count=0,
+                    last_uid=None,
+                    reset=False,
+                    full_check=False,
+                )
+                search.return_value = []
+
+                search_messages_context(folder="INBOX", query="keyword", limit=20)
+
+        self.assertEqual(sync.call_args.kwargs["initial_limit"], 100)
+        self.assertEqual(sync.call_args.kwargs["incremental_limit"], 100)
 
     def test_rejects_invalid_body_read_parameters(self):
         for invalid_uid in ("", "   "):

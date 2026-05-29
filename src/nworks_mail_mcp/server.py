@@ -11,9 +11,15 @@ from .imap_client import (
     list_messages_since_uid as imap_list_messages_since_uid,
     search_messages_by_body as imap_search_messages_by_body,
 )
+from .index_sync import (
+    search_mail_index,
+    sync_mail_index as sync_mail_index_impl,
+    sync_result_dict,
+)
 from .redaction import (
     redact_mail_body_dict,
     redact_mail_summary_dict,
+    redact_text,
     validate_redaction_config,
 )
 from .state import MailStateStore
@@ -123,6 +129,60 @@ def search_messages_by_body(
     ]
 
 
+@mcp.tool()
+def sync_mail_index(
+    folder: str = "INBOX",
+    initial_limit: int = 2000,
+    incremental_limit: int = 100,
+    full_check: bool = False,
+    allow_blocked_body: bool = False,
+) -> dict:
+    _validate_max_scan(initial_limit)
+    _validate_max_scan(incremental_limit)
+    result = sync_mail_index_impl(
+        folder=folder,
+        initial_limit=initial_limit,
+        incremental_limit=incremental_limit,
+        full_check=full_check,
+        allow_blocked_body=allow_blocked_body,
+        skip_subject_keywords=COMPENSATION_SUBJECT_KEYWORDS,
+        block_reason=COMPENSATION_BLOCK_REASON,
+    )
+    return sync_result_dict(result)
+
+
+@mcp.tool()
+def search_messages_context(
+    folder: str = "INBOX",
+    query: str = "",
+    limit: int = 20,
+) -> dict:
+    _validate_text(query, "query")
+    _validate_limit(limit)
+    try:
+        sync = sync_result_dict(
+            sync_mail_index_impl(
+                folder=folder,
+                initial_limit=100,
+                incremental_limit=100,
+                full_check=False,
+                allow_blocked_body=False,
+                skip_subject_keywords=COMPENSATION_SUBJECT_KEYWORDS,
+                block_reason=COMPENSATION_BLOCK_REASON,
+            )
+        )
+    except Exception as exc:
+        sync = {"ok": False, "error": str(exc)}
+
+    results = search_mail_index(folder=folder, query=query, limit=limit)
+    return {
+        "folder": folder,
+        "query": redact_text(query),
+        "sync": sync,
+        "results": [_context_search_response(result) for result in results],
+    }
+
+
 def main() -> None:
     mcp.run(transport="stdio")
 
@@ -183,6 +243,21 @@ def _blocked_body_response(summary) -> dict[str, str | bool | None]:
         "block_reason": COMPENSATION_BLOCK_REASON,
     }
     return redact_mail_body_dict(response)
+
+
+def _context_search_response(result) -> dict:
+    return {
+        "uid": result.uid,
+        "folder": result.folder,
+        "subject": redact_text(result.subject),
+        "sender": redact_text(result.sender),
+        "date": result.date,
+        "excerpt": redact_text(result.excerpt),
+        "score": result.score,
+        "is_deleted": result.is_deleted,
+        "body_index_blocked": result.body_index_blocked,
+        "block_reason": result.block_reason,
+    }
 
 
 def _is_body_read_blocked(subject: str) -> bool:

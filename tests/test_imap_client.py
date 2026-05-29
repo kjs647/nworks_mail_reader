@@ -156,6 +156,49 @@ class NworksImapClientTest(unittest.TestCase):
         self.assertIsNone(result.uidvalidity)
         self.assertEqual([message.uid for message in result.messages], ["121"])
 
+    def test_list_message_uids_returns_uidvalidity(self):
+        conn = FakeImapConnection(b"121 122", uidvalidity=b"777")
+        client = self.make_client(conn)
+
+        result = client.list_message_uids("INBOX")
+
+        self.assertEqual(result.uids, ["121", "122"])
+        self.assertEqual(result.uidvalidity, 777)
+        self.assertEqual(conn.uid_calls[0], ("search", (None, "ALL")))
+
+    def test_get_messages_for_index_skips_blocked_body_fetch(self):
+        headers = {
+            "121": (
+                b"Subject: 2026 salary\r\nFrom: sender@example.com\r\n"
+                b"Date: Thu, 28 May 2026 09:00:00 +0900\r\n\r\n"
+            ),
+            "122": (
+                b"Subject: General\r\nFrom: sender@example.com\r\n"
+                b"Date: Thu, 28 May 2026 10:00:00 +0900\r\n\r\n"
+            ),
+        }
+        messages = {
+            "122": (
+                b"Subject: General\r\nFrom: sender@example.com\r\n"
+                b"Date: Thu, 28 May 2026 10:00:00 +0900\r\n"
+                b"Content-Type: text/plain; charset=utf-8\r\n\r\nbody"
+            ),
+        }
+        conn = FakeImapConnection(headers=headers, messages=messages)
+        client = self.make_client(conn)
+
+        results = client.get_messages_for_index(
+            "INBOX",
+            ["121", "122"],
+            skip_subject_keywords=("salary",),
+            block_reason="COMPENSATION_SUBJECT",
+        )
+
+        self.assertTrue(results[0].body_index_blocked)
+        self.assertEqual(results[0].block_reason, "COMPENSATION_SUBJECT")
+        self.assertEqual(results[1].body, "body")
+        self.assertNotIn(("fetch", ("121", "(BODY.PEEK[])")), conn.uid_calls)
+
     def test_get_message_body_reads_plain_text_without_marking_seen(self):
         raw_message = (
             b"Subject: Body mail\r\n"
