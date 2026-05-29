@@ -132,7 +132,7 @@ class NworksImapClient:
         self,
         folder: str = "INBOX",
         uid: str = "",
-        max_chars: int = 20000,
+        max_chars: int | None = 20000,
     ) -> MailBody:
         conn = self._require_conn()
 
@@ -142,13 +142,30 @@ class NworksImapClient:
 
         return self._fetch_message_body(uid, max_chars=max_chars)
 
+    def get_message_summary(
+        self,
+        folder: str = "INBOX",
+        uid: str = "",
+    ) -> MailSummary:
+        conn = self._require_conn()
+
+        status, _ = conn.select(folder, readonly=True)
+        if status != "OK":
+            raise RuntimeError(f"Failed to select folder: {folder}")
+
+        message = self._fetch_message_summary(uid)
+        if message is None:
+            raise RuntimeError(f"Failed to fetch message summary for UID: {uid}")
+        return message
+
     def search_messages_by_body(
         self,
         folder: str = "INBOX",
         query: str = "",
         limit: int = 20,
         max_scan: int = 200,
-        max_body_chars: int = 2000,
+        max_body_chars: int | None = 2000,
+        skip_subject_keywords: Sequence[str] | None = None,
     ) -> list[MailBody]:
         conn = self._require_conn()
 
@@ -166,51 +183,64 @@ class NworksImapClient:
         matches: list[MailBody] = []
 
         for uid in recent_uids:
+            if skip_subject_keywords:
+                summary = self._fetch_message_summary(uid)
+                if summary is None:
+                    continue
+                if _contains_keyword(summary.subject, skip_subject_keywords):
+                    continue
             try:
                 message = self._fetch_message_body(uid, max_chars=None)
             except RuntimeError:
                 continue
             if query_text in message.body.casefold():
-                matches.append(_limit_mail_body(message, max_body_chars))
+                matches.append(
+                    _limit_mail_body(message, max_body_chars)
+                    if max_body_chars is not None
+                    else message
+                )
                 if len(matches) >= limit:
                     break
 
         return matches
+
+    def _fetch_message_summary(self, uid: str) -> MailSummary | None:
+        conn = self._require_conn()
+        status, msg_data = conn.uid(
+            "fetch",
+            uid,
+            "(BODY.PEEK[HEADER.FIELDS (SUBJECT FROM DATE)])",
+        )
+
+        if status != "OK" or not msg_data:
+            return None
+
+        msg = self._parse_header(msg_data)
+        if msg is None:
+            return None
+
+        return MailSummary(
+            uid=uid,
+            subject=str(make_header(decode_header(msg.get("Subject", "")))),
+            sender=str(make_header(decode_header(msg.get("From", "")))),
+            date=msg.get("Date", ""),
+        )
 
     def _fetch_message_summaries(
         self,
         uids: Sequence[str],
         stop_on_failure: bool = False,
     ) -> list[MailSummary]:
-        conn = self._require_conn()
         messages: list[MailSummary] = []
 
         for uid in uids:
-            status, msg_data = conn.uid(
-                "fetch",
-                uid,
-                "(BODY.PEEK[HEADER.FIELDS (SUBJECT FROM DATE)])",
-            )
-
-            if status != "OK" or not msg_data:
+            message = self._fetch_message_summary(uid)
+            if message is None:
                 if stop_on_failure:
                     break
                 continue
 
-            msg = self._parse_header(msg_data)
-            if msg is None:
-                if stop_on_failure:
-                    break
-                continue
-
-            messages.append(
-                MailSummary(
-                    uid=uid,
-                    subject=str(make_header(decode_header(msg.get("Subject", "")))),
-                    sender=str(make_header(decode_header(msg.get("From", "")))),
-                    date=msg.get("Date", ""),
-                )
-            )
+            messages.append(message)
 
         return messages
 
@@ -277,7 +307,7 @@ def list_messages_since_uid(
 def get_message_body(
     folder: str = "INBOX",
     uid: str = "",
-    max_chars: int = 20000,
+    max_chars: int | None = 20000,
 ) -> MailBody:
     with NworksImapClient() as client:
         return client.get_message_body(
@@ -287,12 +317,18 @@ def get_message_body(
         )
 
 
+def get_message_summary(folder: str = "INBOX", uid: str = "") -> MailSummary:
+    with NworksImapClient() as client:
+        return client.get_message_summary(folder=folder, uid=uid)
+
+
 def search_messages_by_body(
     folder: str = "INBOX",
     query: str = "",
     limit: int = 20,
     max_scan: int = 200,
-    max_body_chars: int = 2000,
+    max_body_chars: int | None = 2000,
+    skip_subject_keywords: Sequence[str] | None = None,
 ) -> list[MailBody]:
     with NworksImapClient() as client:
         return client.search_messages_by_body(
@@ -301,6 +337,7 @@ def search_messages_by_body(
             limit=limit,
             max_scan=max_scan,
             max_body_chars=max_body_chars,
+            skip_subject_keywords=skip_subject_keywords,
         )
 
 
@@ -420,6 +457,11 @@ def _html_to_text(value: str) -> str:
 def _normalize_text(value: str) -> str:
     lines = [" ".join(line.split()) for line in value.splitlines()]
     return "\n".join(line for line in lines if line).strip()
+
+
+def _contains_keyword(value: str, keywords: Sequence[str]) -> bool:
+    folded = value.casefold()
+    return any(keyword.casefold() in folded for keyword in keywords)
 
 
 def _limit_mail_body(message: MailBody, max_chars: int) -> MailBody:
