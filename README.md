@@ -48,6 +48,19 @@ IMAP을 통해 Naver WORKS 메일을 읽는 Python MCP 서버입니다.
 | `NWORKS_INDEX_PATH` | `.nworks_mail_index.sqlite` | SQLite 검색 인덱스 파일 경로 |
 | `NWORKS_REDACTION_EXTRA_PATTERNS_JSON` | 없음 | 추가 마스킹 정규식 JSON 배열 |
 
+## 로컬 저장 파일
+
+이 서버는 원격 메일함을 수정하지 않는 읽기 전용 서버입니다. 대신 반복 조회와 검색 속도를 위해
+로컬 파일을 만듭니다.
+
+| 파일 | 용도 |
+| --- | --- |
+| `.nworks_mail_state.json` | `read_new_messages`가 폴더별 마지막 UID와 `UIDVALIDITY`를 기억합니다. |
+| `.nworks_mail_index.sqlite` | `sync_mail_index`와 `search_messages_context`가 사용하는 SQLite FTS 인덱스입니다. |
+| `.nworks_mail_index.sqlite-*` | SQLite WAL/SHM 같은 보조 파일입니다. |
+
+위 파일들은 `.gitignore`에 포함되어 있으므로 커밋 대상이 아닙니다.
+
 ## Claude Desktop 설정
 
 GitHub에서 바로 실행할 때는 아래 설정을 사용합니다.
@@ -107,13 +120,22 @@ MCP 설정을 변경한 뒤에는 Claude Desktop을 다시 시작하세요.
 | `sync_mail_index` | SQLite 검색 인덱스를 초기/증분 동기화합니다. |
 | `search_messages_context` | SQLite 인덱스에서 AI가 읽을 검색 후보를 빠르게 반환합니다. |
 
+공통 제한값은 `limit <= 500`, `max_scan <= 5000`, `max_chars <= 100000`입니다.
+
+### 기본 조회 도구
+
 `read_new_messages`는 예약 실행을 위한 도구입니다. 같은 폴더 이름으로 반복 호출하면
 폴더 `UIDVALIDITY`가 바뀌지 않는 한 마지막으로 저장된 UID부터 이어서 읽습니다.
+응답에는 `folder`, `uidvalidity`, `previous_last_uid`, `new_last_uid`, `messages`가
+포함됩니다. 폴더가 초기화되어 `UIDVALIDITY`가 바뀌면 오래된 체크포인트를 사용하지 않고
+현재 메일함 기준으로 다시 판단합니다.
 
 `read_message_body`는 `read_messages` 또는 `read_new_messages`가 반환한 `uid`를 사용합니다.
 기본적으로 최대 20,000자까지 본문을 반환하며, 초과하면 `truncated`가 `true`입니다.
 본문은 `text/plain`을 우선 사용하고, plain 본문이 없으면 `text/html`을 간단히 텍스트로 변환합니다.
 첨부파일 파트는 본문에서 제외합니다.
+
+### 본문 읽기 차단 정책
 
 `read_messages`와 `read_new_messages`는 제목에 `연봉`, `성과급`, `보너스`, `인센티브`,
 `보상`, `급여`, `임금`이 포함된 메시지에 `body_read_blocked: true`와
@@ -129,16 +151,36 @@ MCP 설정을 변경한 뒤에는 Claude Desktop을 다시 시작하세요.
 메일은 본문 검색 대상에서도 제외됩니다. 사용자가 명시적으로 허용하려면
 `allow_blocked_body: true`를 전달합니다.
 
+### SQLite 인덱스 검색
+
 `sync_mail_index`는 기본적으로 최근 2,000개 메일부터 SQLite 인덱스를 만들고, 이후 호출에서는
-새 UID를 최대 100개씩 증분 동기화합니다. `full_check: true`를 전달하면 IMAP의 현재 UID
-목록과 비교해 삭제되거나 이동된 메일을 즉시 정리합니다. 자동 삭제 검사는 하루 1회 수행됩니다.
+마지막 체크포인트보다 큰 새 UID를 최대 100개씩 증분 동기화합니다. 작은 범위의 자동 동기화가
+먼저 실행된 뒤 수동으로 더 큰 `initial_limit`을 요청하면, 아직 색인되지 않은 최근 메일을
+추가로 채웁니다.
+
+`sync_mail_index` 주요 파라미터:
+
+| 이름 | 기본값 | 설명 |
+| --- | --- | --- |
+| `folder` | `INBOX` | 동기화할 IMAP 폴더입니다. |
+| `initial_limit` | `2000` | 첫 동기화 또는 백필 때 최근 몇 개 UID를 색인할지 정합니다. |
+| `incremental_limit` | `100` | 이후 호출에서 새 UID를 한 번에 몇 개까지 색인할지 정합니다. |
+| `full_check` | `false` | 현재 IMAP UID 목록과 비교해 삭제되거나 이동된 메일을 바로 표시합니다. |
+| `allow_blocked_body` | `false` | 보상 관련 제목의 본문 색인을 명시적으로 허용합니다. |
+
+응답에는 `ok`, `folder`, `uidvalidity`, `indexed_count`, `deleted_count`, `last_uid`,
+`reset`, `full_check`가 포함됩니다. `UIDVALIDITY`가 바뀌면 해당 폴더 인덱스를 초기화하고
+다시 색인합니다. `full_check: true`를 전달하지 않아도 삭제 검사는 하루 1회 자동 수행됩니다.
 
 `search_messages_context`는 검색 전에 새 메일을 최대 100개까지 동기화한 뒤 SQLite FTS
 인덱스에서 기본 상위 20개 후보를 반환합니다. 응답에는 `uid`, `folder`, `subject`,
-`sender`, `date`, `excerpt`, `score`, `body_index_blocked`, `block_reason`이 포함됩니다.
+`sender`, `date`, `excerpt`, `score`, `is_deleted`, `body_index_blocked`, `block_reason`이 포함됩니다.
 동기화가 실패해도 기존 인덱스가 있으면 검색을 계속하고 `sync.ok: false`와 오류 메시지를
 함께 반환합니다. 서버 내부에서 LLM이나 임베딩 API를 호출하지 않으며, MCP 클라이언트의 AI가
 반환된 후보를 읽고 문맥 판단을 수행합니다.
+
+SQLite 검색은 FTS5 `unicode61` 토크나이저를 사용합니다. FTS 결과가 없으면 한국어 조사나
+복합어 때문에 놓치는 경우를 줄이기 위해 토큰별 `LIKE` 조건으로 한 번 더 검색합니다.
 
 SQLite 인덱스에는 검색 품질을 위해 마스킹 전 추출 텍스트 본문을 저장합니다. 첨부파일,
 이미지, 원본 MIME 전체, base64 원문은 저장하지 않습니다. MCP 응답에는 기존 마스킹 정책을
@@ -163,6 +205,8 @@ URL query의 `token`, `access_token`, `refresh_token`, `api_key`, `key`, `secret
 
 `search_messages_by_body`는 검색 매칭을 위해 원문 본문을 읽은 뒤 반환값만 마스킹합니다.
 다만 보상 관련 제목은 기본적으로 본문을 읽지 않으므로 검색 대상에서 제외됩니다.
+`search_messages_context`도 인덱스의 원문 텍스트로 검색한 뒤 응답의 `query`, `subject`,
+`sender`, `excerpt`에 마스킹을 적용합니다.
 
 마스킹은 완전한 DLP가 아니라 MCP 응답과 자동 루틴에서 민감값 노출을 줄이는 방어 계층입니다.
 
@@ -185,7 +229,9 @@ uv run python -c "from nworks_mail_mcp.server import main; print('server import 
 ## 보안 참고 사항
 
 - 실제 메일 주소, 비밀번호, 앱 비밀번호, Claude 설정 파일, `.env` 파일,
-  `.nworks_mail_state.json`은 커밋하지 마세요.
+  `.nworks_mail_state.json`, `.nworks_mail_index.sqlite`는 커밋하지 마세요.
 - 비밀번호나 앱 비밀번호를 실수로 GitHub에 푸시했다면 즉시 폐기하고 새로 생성하세요.
 - 이 서버는 사용자가 허용한 메일 본문을 MCP 응답으로 반환할 수 있으므로 민감한 메일 내용을
   신뢰하지 않는 클라이언트나 로그에 노출하지 않도록 주의하세요.
+- SQLite 인덱스에는 마스킹 전 본문 텍스트가 저장될 수 있으므로 로컬 파일 권한과 백업 대상을
+  신뢰할 수 있는 범위로 제한하세요.
