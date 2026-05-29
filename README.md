@@ -13,6 +13,8 @@ MCP 도구를 제공합니다.
 - 특정 폴더의 메시지 헤더를 읽습니다.
 - UID로 특정 메일 본문을 읽습니다.
 - 최근 메일 본문에서 키워드를 검색합니다.
+- 주민등록번호, 토큰, 비밀번호 같은 민감값을 MCP 응답에서 마스킹합니다.
+- 제목에 보상 관련 단어가 포함된 메일은 기본적으로 본문을 읽지 않습니다.
 - 예약 조회를 위해 폴더별 마지막으로 읽은 IMAP UID를 기억합니다.
 - 폴더가 초기화된 뒤 오래된 체크포인트를 신뢰하지 않도록 IMAP `UIDVALIDITY`를 추적합니다.
 - 기본적으로 `.nworks_mail_state.json`에 로컬 읽기 상태를 저장합니다.
@@ -41,6 +43,7 @@ MCP 도구를 제공합니다.
 | `NWORKS_IMAP_HOST` | `imap.worksmobile.com` | IMAP 호스트 |
 | `NWORKS_IMAP_PORT` | `993` | IMAP SSL 포트 |
 | `NWORKS_STATE_PATH` | `.nworks_mail_state.json` | 로컬 체크포인트 파일 경로 |
+| `NWORKS_REDACTION_EXTRA_PATTERNS_JSON` | 없음 | 추가 마스킹 정규식 JSON 배열 |
 
 ## Claude Desktop 설정
 
@@ -107,9 +110,39 @@ MCP 설정을 변경한 뒤에는 Claude Desktop을 다시 시작하세요.
 본문은 `text/plain`을 우선 사용하고, plain 본문이 없으면 `text/html`을 간단히 텍스트로 변환합니다.
 첨부파일 파트는 본문에서 제외합니다.
 
+`read_messages`와 `read_new_messages`는 제목에 `연봉`, `성과급`, `보너스`, `인센티브`,
+`보상`, `급여`, `임금`이 포함된 메시지에 `body_read_blocked: true`와
+`block_reason: "COMPENSATION_SUBJECT"`를 표시합니다. 이런 메시지는 `read_message_body`가
+기본적으로 본문을 가져오지 않고 `body: "[BLOCKED:COMPENSATION_SUBJECT]"`를 반환합니다.
+사용자가 목록을 확인한 뒤 본문 읽기를 명시적으로 허용하려면 `read_message_body`에
+`allow_blocked_body: true`를 전달합니다. 예약 실행이나 루틴 호출은 기본값을 사용하므로
+차단된 본문을 읽지 않습니다.
+
 `search_messages_by_body`는 최근 UID부터 기본 200개까지 본문을 스캔해 대소문자 구분 없이
 `query`가 포함된 메일을 반환합니다. 검색 결과의 본문은 기본 2,000자로 제한됩니다.
-메일함이 크면 `max_scan`을 필요한 범위로 조절하세요.
+메일함이 크면 `max_scan`을 필요한 범위로 조절하세요. 기본적으로 보상 관련 제목의
+메일은 본문 검색 대상에서도 제외됩니다. 사용자가 명시적으로 허용하려면
+`allow_blocked_body: true`를 전달합니다.
+
+## 마스킹 정책
+
+MCP 응답으로 반환되는 제목, 발신자, 본문에는 기본 마스킹이 적용됩니다. 기본 대상은
+주민등록번호 형식, JWT, `Authorization: Bearer ...`, `access_token`, `refresh_token`,
+`api_key`, `x-api-key`, `password`, `secret`, `private_key` 계열 key-value,
+URL query의 `token`, `access_token`, `refresh_token`, `api_key`, `key`, `secret`입니다.
+치환값은 `[REDACTED:<TYPE>]` 형식입니다.
+
+이메일 주소와 전화번호는 기본 마스킹 대상이 아닙니다. 카드번호와 계좌번호도 오탐을
+줄이기 위해 기본 대상에서 제외했습니다. 추가로 가리고 싶은 패턴은 JSON 배열로 설정합니다.
+
+```json
+["Project-[0-9]+", "CONFIDENTIAL-[A-Z]+"]
+```
+
+`search_messages_by_body`는 검색 매칭을 위해 원문 본문을 읽은 뒤 반환값만 마스킹합니다.
+다만 보상 관련 제목은 기본적으로 본문을 읽지 않으므로 검색 대상에서 제외됩니다.
+
+마스킹은 완전한 DLP가 아니라 MCP 응답과 자동 루틴에서 민감값 노출을 줄이는 방어 계층입니다.
 
 ## 개발
 
@@ -132,5 +165,5 @@ uv run python -c "from nworks_mail_mcp.server import main; print('server import 
 - 실제 메일 주소, 비밀번호, 앱 비밀번호, Claude 설정 파일, `.env` 파일,
   `.nworks_mail_state.json`은 커밋하지 마세요.
 - 비밀번호나 앱 비밀번호를 실수로 GitHub에 푸시했다면 즉시 폐기하고 새로 생성하세요.
-- 이 서버는 요청한 메일 본문을 MCP 응답으로 반환할 수 있으므로 민감한 메일 내용을
+- 이 서버는 사용자가 허용한 메일 본문을 MCP 응답으로 반환할 수 있으므로 민감한 메일 내용을
   신뢰하지 않는 클라이언트나 로그에 노출하지 않도록 주의하세요.

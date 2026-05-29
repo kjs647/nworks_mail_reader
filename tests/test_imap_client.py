@@ -12,12 +12,14 @@ class FakeImapConnection:
         list_rows=None,
         uidvalidity: bytes | None = b"777",
         messages=None,
+        headers=None,
     ):
         self.search_result = search_result
         self.failed_fetch_uids = set(failed_fetch_uids or [])
         self.list_rows = list_rows or []
         self.uidvalidity = uidvalidity
         self.messages = messages or {}
+        self.headers = headers or {}
         self.uid_calls = []
         self.selected = []
 
@@ -44,6 +46,8 @@ class FakeImapConnection:
                 return "NO", []
             if fetch_spec == "(BODY.PEEK[])":
                 return "OK", [(b"RFC822", self.messages[uid])]
+            if uid in self.headers:
+                return "OK", [(b"HEADER", self.headers[uid])]
             raw = (
                 b"Subject: Test " + uid.encode("ascii") + b"\r\n"
                 b"From: sender@example.com\r\n"
@@ -175,6 +179,23 @@ class NworksImapClientTest(unittest.TestCase):
         self.assertEqual(conn.selected, [("INBOX", True)])
         self.assertIn(("fetch", ("121", "(BODY.PEEK[])")), conn.uid_calls)
 
+    def test_get_message_summary_fetches_header_without_body(self):
+        raw_header = (
+            b"Subject: Header only\r\n"
+            b"From: sender@example.com\r\n"
+            b"Date: Thu, 28 May 2026 10:00:00 +0900\r\n"
+            b"\r\n"
+        )
+        conn = FakeImapConnection(headers={"121": raw_header})
+        client = self.make_client(conn)
+
+        message = client.get_message_summary("INBOX", "121")
+
+        self.assertEqual(message.uid, "121")
+        self.assertEqual(message.subject, "Header only")
+        self.assertEqual(conn.selected, [("INBOX", True)])
+        self.assertNotIn(("fetch", ("121", "(BODY.PEEK[])")), conn.uid_calls)
+
     def test_get_message_body_prefers_plain_text_and_skips_attachments(self):
         raw_message = (
             b"Subject: Multipart\r\n"
@@ -253,6 +274,48 @@ class NworksImapClientTest(unittest.TestCase):
         self.assertEqual(results[0].subject, "Match")
         self.assertEqual(results[0].body, "Project KE")
         self.assertTrue(results[0].truncated)
+        self.assertNotIn(("fetch", ("121", "(BODY.PEEK[])")), conn.uid_calls)
+
+    def test_search_messages_by_body_skips_blocked_subjects_before_body_fetch(self):
+        headers = {
+            "121": (
+                b"Subject: 2026 salary\r\nFrom: sender@example.com\r\n"
+                b"Date: Thu, 28 May 2026 09:00:00 +0900\r\n\r\n"
+            ),
+            "122": (
+                b"Subject: General\r\nFrom: sender@example.com\r\n"
+                b"Date: Thu, 28 May 2026 10:00:00 +0900\r\n\r\n"
+            ),
+        }
+        messages = {
+            "121": (
+                b"Subject: 2026 salary\r\nFrom: sender@example.com\r\n"
+                b"Date: Thu, 28 May 2026 09:00:00 +0900\r\n"
+                b"Content-Type: text/plain; charset=utf-8\r\n\r\nkeyword"
+            ),
+            "122": (
+                b"Subject: General\r\nFrom: sender@example.com\r\n"
+                b"Date: Thu, 28 May 2026 10:00:00 +0900\r\n"
+                b"Content-Type: text/plain; charset=utf-8\r\n\r\nkeyword"
+            ),
+        }
+        conn = FakeImapConnection(
+            search_result=b"121 122",
+            messages=messages,
+            headers=headers,
+        )
+        client = self.make_client(conn)
+
+        results = client.search_messages_by_body(
+            "INBOX",
+            query="keyword",
+            limit=5,
+            max_scan=2,
+            max_body_chars=100,
+            skip_subject_keywords=("salary",),
+        )
+
+        self.assertEqual([message.uid for message in results], ["122"])
         self.assertNotIn(("fetch", ("121", "(BODY.PEEK[])")), conn.uid_calls)
 
 

@@ -5,10 +5,16 @@ from mcp.server.fastmcp import FastMCP
 from .config import load_state_path
 from .imap_client import (
     get_message_body as imap_get_message_body,
+    get_message_summary as imap_get_message_summary,
     list_folders as imap_list_folders,
     list_messages as imap_list_messages,
     list_messages_since_uid as imap_list_messages_since_uid,
     search_messages_by_body as imap_search_messages_by_body,
+)
+from .redaction import (
+    redact_mail_body_dict,
+    redact_mail_summary_dict,
+    validate_redaction_config,
 )
 from .state import MailStateStore
 
@@ -17,6 +23,18 @@ mcp = FastMCP("nmail-reader")
 MAX_LIMIT = 500
 MAX_BODY_CHARS = 100000
 MAX_SCAN = 5000
+COMPENSATION_SUBJECT_KEYWORDS = (
+    "연봉",
+    "성과급",
+    "보너스",
+    "인센티브",
+    "보상",
+    "급여",
+    "임금",
+)
+COMPENSATION_BLOCK_REASON = "COMPENSATION_SUBJECT"
+COMPENSATION_BLOCK_BODY = "[BLOCKED:COMPENSATION_SUBJECT]"
+validate_redaction_config()
 
 
 @mcp.tool()
@@ -25,9 +43,9 @@ def list_folders() -> list[dict[str, str]]:
 
 
 @mcp.tool()
-def read_messages(folder: str = "INBOX", limit: int = 10) -> list[dict[str, str]]:
+def read_messages(folder: str = "INBOX", limit: int = 10) -> list[dict]:
     _validate_limit(limit)
-    return [asdict(message) for message in imap_list_messages(folder, limit)]
+    return [_message_summary_response(message) for message in imap_list_messages(folder, limit)]
 
 
 @mcp.tool()
@@ -57,7 +75,7 @@ def read_new_messages(folder: str = "INBOX", limit: int = 50) -> dict:
         "uidvalidity": result.uidvalidity,
         "previous_last_uid": previous_last_uid,
         "new_last_uid": new_last_uid,
-        "messages": [asdict(message) for message in result.messages],
+        "messages": [_message_summary_response(message) for message in result.messages],
     }
 
 
@@ -66,10 +84,16 @@ def read_message_body(
     folder: str = "INBOX",
     uid: str = "",
     max_chars: int = 20000,
-) -> dict[str, str | bool]:
+    allow_blocked_body: bool = False,
+) -> dict[str, str | bool | None]:
     _validate_text(uid, "uid")
     _validate_max_chars(max_chars)
-    return asdict(imap_get_message_body(folder, uid, max_chars))
+    summary = imap_get_message_summary(folder, uid)
+    if _is_body_read_blocked(summary.subject) and not allow_blocked_body:
+        return _blocked_body_response(summary)
+
+    message = imap_get_message_body(folder, uid, None)
+    return _message_body_response(message, max_chars)
 
 
 @mcp.tool()
@@ -79,19 +103,22 @@ def search_messages_by_body(
     limit: int = 20,
     max_scan: int = 200,
     max_body_chars: int = 2000,
-) -> list[dict[str, str | bool]]:
+    allow_blocked_body: bool = False,
+) -> list[dict[str, str | bool | None]]:
     _validate_text(query, "query")
     _validate_limit(limit)
     _validate_max_scan(max_scan)
     _validate_max_chars(max_body_chars)
+    skip_subject_keywords = None if allow_blocked_body else COMPENSATION_SUBJECT_KEYWORDS
     return [
-        asdict(message)
+        _message_body_response(message, max_body_chars)
         for message in imap_search_messages_by_body(
             folder,
             query,
             limit,
             max_scan,
-            max_body_chars,
+            None,
+            skip_subject_keywords,
         )
     ]
 
@@ -124,3 +151,40 @@ def _validate_max_scan(max_scan: int) -> None:
 def _validate_text(value: str, name: str) -> None:
     if not value.strip():
         raise ValueError(f"{name} must not be empty")
+
+
+def _message_summary_response(message) -> dict:
+    response = asdict(message)
+    blocked = _is_body_read_blocked(message.subject)
+    response["body_read_blocked"] = blocked
+    response["block_reason"] = COMPENSATION_BLOCK_REASON if blocked else None
+    return redact_mail_summary_dict(response)
+
+
+def _message_body_response(message, max_chars: int) -> dict:
+    response = asdict(message)
+    response["blocked"] = False
+    response["can_override"] = False
+    response["block_reason"] = None
+    return redact_mail_body_dict(response, max_chars=max_chars)
+
+
+def _blocked_body_response(summary) -> dict[str, str | bool | None]:
+    response = {
+        "uid": summary.uid,
+        "subject": summary.subject,
+        "sender": summary.sender,
+        "date": summary.date,
+        "body": COMPENSATION_BLOCK_BODY,
+        "body_text_type": "blocked",
+        "truncated": False,
+        "blocked": True,
+        "can_override": True,
+        "block_reason": COMPENSATION_BLOCK_REASON,
+    }
+    return redact_mail_body_dict(response)
+
+
+def _is_body_read_blocked(subject: str) -> bool:
+    folded = subject.casefold()
+    return any(keyword.casefold() in folded for keyword in COMPENSATION_SUBJECT_KEYWORDS)
